@@ -33,6 +33,7 @@ class PPOSettings:
     learning_rate: float = 3e-4
     adam_eps: float = 1e-5
     entropy_coef: float = 0.01
+    # Multiplies the mean squared error. The critic term in the loss is 0.5 * MSE.
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     total_env_steps: int = TOTAL_ENV_STEPS

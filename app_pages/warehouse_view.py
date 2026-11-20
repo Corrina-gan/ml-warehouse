@@ -3,14 +3,18 @@
 import base64
 import io
 import warnings
+from pathlib import Path
 
 import numpy as np
 import streamlit as st
 from PIL import Image
 from rware.warehouse import Direction
 
-from environment.config import ACTION_NAMES, MAX_STEPS, N_ACTIONS, N_AGENTS
+from environment.config import ACTION_NAMES, MAX_STEPS, N_ACTIONS, N_AGENTS, SEEDS
 from environment.environment import make_warehouse
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PPO_RESULTS = PROJECT_ROOT / "results" / "ppo"
 
 CELL = 48
 ROBOT_COLORS = ((255, 140, 0), (30, 136, 229))
@@ -26,15 +30,28 @@ DIRECTION_NAMES = ("up", "down", "left", "right")
 
 
 def show_warehouse():
-    """Seed, play, and step controls for one random episode."""
+    """Algorithm, seed, play, and step controls for one episode."""
     st.session_state.setdefault("warehouse_step", 0)
     st.session_state.setdefault("warehouse_playing", False)
     st.session_state.setdefault("warehouse_seed", 0)
+    choices = _algorithm_choices()
+    st.session_state.setdefault("warehouse_algorithm", choices[0][0])
 
     def reset_view():
         st.session_state["warehouse_step"] = 0
         st.session_state["warehouse_playing"] = False
 
+    labels = {key: label for key, label, _mtime in choices}
+    if st.session_state["warehouse_algorithm"] not in labels:
+        st.session_state["warehouse_algorithm"] = choices[0][0]
+    st.selectbox(
+        "Algorithm",
+        [key for key, _label, _mtime in choices],
+        format_func=labels.get,
+        key="warehouse_algorithm",
+        on_change=reset_view,
+        help="Random takes a uniform action. PPO plays the greedy policy from the 100,000-step run.",
+    )
     st.number_input(
         "Seed",
         min_value=0,
@@ -43,7 +60,15 @@ def show_warehouse():
         on_change=reset_view,
         help="Same seeds as the analysis. Seed 0 is the sample episode.",
     )
-    episode = record_episode(int(st.session_state["warehouse_seed"]))
+    algorithm = st.session_state["warehouse_algorithm"]
+    weights_mtime = next(mtime for key, _label, mtime in choices if key == algorithm)
+    try:
+        episode = record_episode(int(st.session_state["warehouse_seed"]), algorithm, weights_mtime)
+    except ModuleNotFoundError as exc:
+        if exc.name != "torch":
+            raise
+        st.error("PPO needs PyTorch in the environment that runs this app.")
+        return
     length = len(episode["frames"]) - 1
     st.session_state["warehouse_step"] = min(int(st.session_state["warehouse_step"]), length)
 
@@ -62,7 +87,7 @@ def show_warehouse():
         _paused(episode)
 
 
-@st.fragment(run_every=0.2)
+@st.fragment(run_every=0.05)
 def _playing(episode):
     length = len(episode["frames"]) - 1
     nxt = min(int(st.session_state.get("warehouse_step", 0)) + 1, length)
@@ -94,6 +119,7 @@ def _draw(episode):
     frame = episode["frames"][step]
     st.html(_image_html(render(episode["layout"], frame)))
     st.caption(
+        f"{_algorithm_label(st.session_state['warehouse_algorithm'])}. "
         f"Seed {st.session_state['warehouse_seed']}, step {step} of {length}. "
         "Orange is robot 1. Blue is robot 2. The black mark is the direction they face."
     )
@@ -115,9 +141,34 @@ def _draw(episode):
     st.caption(" ".join(lines))
 
 
+def _algorithm_choices():
+    """Random, plus each official 100k PPO run whose weights are on disk."""
+    choices = [("random", "Random", 0)]
+    for seed in SEEDS:
+        path = PPO_RESULTS / f"seed_{seed}" / "ppo.pt"
+        if path.is_file():
+            choices.append((f"ppo:{path.resolve()}", f"PPO, seed {seed}", path.stat().st_mtime_ns))
+    return choices
+
+
+def _algorithm_label(algorithm):
+    for key, label, _mtime in _algorithm_choices():
+        if key == algorithm:
+            return label
+    return "Random"
+
+
+@st.cache_resource(show_spinner="Loading the PPO policy")
+def _load_ppo(path):
+    from algorithms.PPO.ppo import load_agent
+
+    return load_agent(path)
+
+
 @st.cache_data(show_spinner="Placing the robots in the warehouse")
-def record_episode(seed):
-    """One random episode. Each frame stores robot and shelf positions only."""
+def record_episode(seed, algorithm, weights_mtime):
+    """One episode under the selected policy. Frames store positions only."""
+    del weights_mtime
     warnings.filterwarnings(
         "ignore",
         category=UserWarning,
@@ -125,7 +176,7 @@ def record_episode(seed):
     )
     env = make_warehouse()
     try:
-        env.reset(seed=int(seed))
+        observations, _info = env.reset(seed=int(seed))
         warehouse = env.unwrapped
         layout = {
             "rows": int(warehouse.grid_size[0]),
@@ -135,9 +186,13 @@ def record_episode(seed):
         }
         frames = [_snapshot(warehouse, None)]
         rng = np.random.default_rng(int(seed))
+        agent = None if algorithm == "random" else _load_ppo(algorithm.removeprefix("ppo:"))
         for _step in range(MAX_STEPS):
-            actions = tuple(int(action) for action in rng.integers(0, N_ACTIONS, size=N_AGENTS))
-            _observations, rewards, terminated, truncated, _info = env.step(actions)
+            if agent is None:
+                actions = tuple(int(action) for action in rng.integers(0, N_ACTIONS, size=N_AGENTS))
+            else:
+                actions = agent.act_greedy(observations)
+            observations, rewards, terminated, truncated, _info = env.step(actions)
             frames.append(_snapshot(warehouse, actions, rewards))
             if terminated or truncated:
                 break
