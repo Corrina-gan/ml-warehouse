@@ -6,7 +6,7 @@ Run from the project root:
 
 That trains seeds 0, 1, and 2 for 100,000 environment steps each. The greedy
 policy is scored every 10,000 steps on the held-out evaluation seeds. The
-number to compare with SARSA and REINFORCE is team_return_mean.
+number to compare with Q-learning, SARSA, and REINFORCE is team_return_mean.
 """
 
 import argparse
@@ -21,18 +21,25 @@ import torch
 
 from algorithms.PPO.config import PPOSettings
 from algorithms.PPO.ppo import PPOAgent
+from shared.task_features import DIAMETER
+from shared.training_utils import collect_steps
 from environment.config import EVAL_EPISODES, N_AGENTS, SEEDS
 from environment.environment import check_contract, make_warehouse
+from shared.episode_debug import write_episode_debug
 from shared.evaluation import evaluate, format_score
 from shared.seeding import first_episode_seed, set_seed
-from shared.training_utils import collect_steps
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT = PROJECT_ROOT / "results" / "ppo"
 
 
-def train_seed(run_seed, settings, eval_episodes, output_dir):
-    """Train one run id and write its logs, weights, and final score."""
+def train_seed(run_seed, settings, eval_episodes, output_dir, eval_seeds=None, debug=True):
+    """Train one run id and write its logs, weights, and final score.
+
+    eval_seeds scores this run somewhere other than the official evaluation
+    seeds. debug writes the per-episode trace. The hyperparameter search
+    turns the trace off.
+    """
     set_seed(run_seed)
     agent = PPOAgent(settings)
     env = make_warehouse()
@@ -41,6 +48,7 @@ def train_seed(run_seed, settings, eval_episodes, output_dir):
     training_rows = []
     eval_rows = []
     steps = 0
+    episode_index = 0
     seed = first_episode_seed(run_seed)
     observations = None
     last_eval_step = None
@@ -49,14 +57,24 @@ def train_seed(run_seed, settings, eval_episodes, output_dir):
     try:
         while steps < settings.total_env_steps:
             remaining = settings.total_env_steps - steps
+            probabilities = []
+
+            def choose(observations, _agent=agent, _probabilities=probabilities):
+                _probabilities.append(_agent.action_probabilities(observations))
+                return _agent.choose_actions(observations)
+
             rollout = collect_steps(
                 env,
-                agent.choose_actions,
+                choose,
                 min(settings.rollout_steps, remaining),
                 seed=seed,
                 observations=observations,
             )
-            metrics = agent.update(rollout)
+            if debug:
+                episode_index = _write_rollout_debug(
+                    directory, rollout.transitions, probabilities, episode_index, settings.total_env_steps, steps
+                )
+            metrics = agent.update(rollout, env_steps=steps)
             steps += len(rollout.transitions)
             seed = rollout.next_seed
             observations = rollout.observations
@@ -65,7 +83,7 @@ def train_seed(run_seed, settings, eval_episodes, output_dir):
             _print_update(row, settings.total_env_steps)
 
             if _due(steps, settings.eval_every_steps) and eval_episodes > 0:
-                score = _evaluate(agent, eval_episodes)
+                score = _evaluate(agent, eval_episodes, eval_seeds)
                 last_eval_step = steps
                 eval_rows.append(_eval_row(steps, score))
                 print(format_score(score), flush=True)
@@ -74,7 +92,7 @@ def train_seed(run_seed, settings, eval_episodes, output_dir):
 
     agent.save(directory / "ppo.pt")
     if eval_episodes > 0 and last_eval_step != steps:
-        score = _evaluate(agent, eval_episodes)
+        score = _evaluate(agent, eval_episodes, eval_seeds)
         eval_rows.append(_eval_row(steps, score))
         print(format_score(score), flush=True)
 
@@ -86,20 +104,46 @@ def train_seed(run_seed, settings, eval_episodes, output_dir):
     return score
 
 
+def _write_rollout_debug(directory, transitions, probabilities, episode_index, total_steps, steps_before):
+    """Split a rollout on episode boundaries and write one debug record each."""
+    batch = []
+    batch_probabilities = []
+    consumed = 0
+    for index, transition in enumerate(transitions):
+        batch.append(transition)
+        if index < len(probabilities):
+            batch_probabilities.append(probabilities[index])
+        consumed += 1
+        if transition.done or index == len(transitions) - 1:
+            episode_index += 1
+            write_episode_debug(
+                directory,
+                episode_index,
+                batch,
+                batch_probabilities,
+                keep_trace=episode_index == 1 or steps_before + consumed >= total_steps,
+            )
+            batch = []
+            batch_probabilities = []
+    return episode_index
+
+
 def _due(steps, eval_every):
     return eval_every > 0 and steps % eval_every == 0
 
 
-def _evaluate(agent, episodes):
+def _evaluate(agent, episodes, seeds=None):
     """Score the greedy policy without changing the training random state.
 
     evaluate() seeds the action RNGs for each test episode. Training samples
     the next rollout from the run seed's generator, so that generator is
-    restored afterwards.
+    restored afterwards. seeds replaces the official evaluation seeds when
+    a search is scoring a trial.
     """
     state = _capture_rng()
     try:
-        return evaluate(agent.act_greedy, episodes=episodes)
+        chosen = None if seeds is None else tuple(int(seed) for seed in seeds)[:episodes]
+        return evaluate(agent.act_greedy, episodes=episodes, seeds=chosen)
     finally:
         _restore_rng(state)
 
@@ -129,6 +173,7 @@ def _print_update(row, total_steps):
         f"policy {row['policy_loss']:.4f} "
         f"value {row['value_loss']:.4f} "
         f"entropy {row['entropy']:.3f} "
+        f"coef {row['entropy_coef']:.3f} "
         f"kl {row['approx_kl']:.4f} "
         f"clip {row['clip_fraction']:.2%} "
         f"team reward {row['team_reward_sum']:.0f}",
@@ -194,10 +239,42 @@ def _write_protocol(path, run_seed, settings, eval_episodes, score):
         "algorithm": "PPO",
         "run_seed": run_seed,
         "first_episode_seed": first_episode_seed(run_seed),
-        "learning_signal": "team reward, the sum of the two robot rewards, given to both robots",
+        "learning_signal": (
+            "each robot's warehouse reward plus its own stage bonus: +0.05 per cell "
+            "closer to a requested shelf, +0.20 for picking that shelf up, +0.05 per "
+            "cell closer to a goal while carrying it, and -0.05 when a forward is "
+            "blocked. A missed load toggle is not charged. Closer pays only for a "
+            "new best distance, so circling a shelf does not pay again. A delivery is the warehouse "
+            "reward of 1. A successful step that does not get closer is not penalised. "
+            "The logged team reward and the evaluation score are the warehouse sum only."
+        ),
+        "observation": (
+            "71 warehouse values plus the offset to the nearest requested shelf. "
+            "After that shelf is picked up, the offset switches to the nearest goal. "
+            "The goal offset is zero before the pickup. PPO multiplies the four "
+            f"offset numbers by {settings.destination_scale:g} before the network, "
+            f"so one cell of error has size {settings.destination_scale / DIAMETER:g}. "
+            f"Column and row are multiplied by {settings.coordinate_scale:g}. "
+            "The requested-shelf bit on the robot's own cell is multiplied by "
+            f"{settings.requested_scale:g}, because those offsets are zero when "
+            "the robot is standing on the shelf it should pick up. "
+            "The carrying flag stays 0 or 1."
+        ),
         "parameter_sharing": True,
-        "actor": "categorical policy over 5 actions, shared by both robots, greedy argmax at evaluation",
-        "critic": "separate value network for V(s) of the team return, same hidden widths as the actor",
+        "actor": (
+            "categorical policy over 5 actions, shared by both robots. "
+            f"The entropy coefficient falls linearly from {settings.entropy_coef_start:g} "
+            f"to {settings.entropy_coef_end:g} across the step budget. "
+            "Greedy evaluation is argmax, and a tie that includes no-op does not become no-op. "
+            "Forward is removed from the distribution when it would hit the map edge, "
+            "the other robot, or a standing shelf while this robot is carrying one."
+        ),
+        "critic": (
+            "separate value network, same hidden widths as the actor. "
+            "Its target is that robot's learning reward, including the stage bonus. "
+            "The actor and the critic both see the scaled destination offsets. "
+            "The recorded team return does not include the stage bonus."
+        ),
         "bootstrap": (
             "is_true_terminal stays false at the 500-step limit, so the value "
             "target bootstraps from the observation returned by step(). done "
