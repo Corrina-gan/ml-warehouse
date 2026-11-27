@@ -8,6 +8,10 @@ separate unload action in the score. The sequence that earns the 1 is:
 1. Move to a requested shelf.
 2. Toggle load to pick it up.
 3. Carry it onto a goal. The warehouse then pays 1 and replaces the request.
+4. Carry the delivered shelf to a free storage cell and toggle load to put
+   it down. A robot holds one shelf at a time, so it cannot pick up the
+   next request before this. Without this step each robot delivers once
+   and then carries that shelf for the rest of the episode.
 
 That 1 is the delivery reward. The bonus below is added on top of it during
 training and is not part of the logged team return or evaluate().
@@ -25,9 +29,14 @@ Suggested schedule, per robot:
   neural policies, so they walked past a shelf they were standing on.
 - Successfully delivers the shelf: the warehouse reward of +1.00, not a
   second copy of that 1 inside this bonus.
+- Moves closer to a free storage cell while carrying a shelf nobody is
+  asking for: +0.05 per cell. After a delivery that is the delivered shelf.
+- Puts that shelf down on a storage cell: +0.20. Picking up a shelf nobody
+  asked for costs 0.20, so lifting a shelf and setting it down again pays
+  nothing in total, whether or not it was requested.
 
-Closer-to-shelf and closer-to-goal pay only for a new best distance this
-episode. Walking away and back to the same shelf does not pay again, so
+Closer-to-shelf, closer-to-goal, and closer-to-storage pay only for a new
+best distance this episode. Walking away and back to the same shelf does not pay again, so
 circling a shelf is not worth more than picking it up. A step that goes
 around an obstacle still pays nothing for distance, and it is not charged.
 Charging that detour made the greedy action keep walking into the shelf,
@@ -45,10 +54,14 @@ APPROACH_PER_CELL = 0.05
 CARRY_PER_CELL = 0.05
 PICKUP = 0.20
 OBSTACLE = -0.05
+# The walk back to storage pays like the other two walks, and putting the
+# shelf down pays what a pickup pays.
+RETURN_PER_CELL = 0.05
+PUT_BACK = 0.20
 
 
 class ProgressRecord:
-    """Best distance so far, per robot, for the shelf and for the goal.
+    """Best distance so far, per robot, for the shelf, the goal, and the way back to storage.
 
     Reset at each episode boundary. A new request queue also clears the
     approach record, because the shelf being chased has changed.
@@ -57,21 +70,25 @@ class ProgressRecord:
     def __init__(self, n_agents=N_AGENTS):
         self.approach = [None] * int(n_agents)
         self.carry = [None] * int(n_agents)
+        self.back = [None] * int(n_agents)
         self.targets = None
 
     def reset(self):
         for index in range(len(self.approach)):
             self.approach[index] = None
             self.carry[index] = None
+            self.back[index] = None
         self.targets = None
 
 
-def robot_bonuses(before, after, requested_cells, goals, warehouse_team_reward, actions, progress):
+def robot_bonuses(before, after, requested_cells, goals, warehouse_team_reward, actions, progress, free_cells):
     """One progress bonus per robot, excluding the warehouse reward.
 
     before and after are tuples of (x, y, carrying_requested, carrying).
     requested_cells and goals are (x, y) pairs from before the step.
     actions is one action id per robot, the action that produced after.
+    free_cells is one tuple of (x, y) pairs per robot: the storage cells
+    where that robot could put its shelf down, from before the step.
     On a delivery the approach term is skipped, because the queue has
     already been replaced. A rejected move is still charged.
     """
@@ -82,23 +99,26 @@ def robot_bonuses(before, after, requested_cells, goals, warehouse_team_reward, 
         )
     if not isinstance(progress, ProgressRecord):
         raise TypeError("robot_bonuses needs the episode ProgressRecord")
+    if len(free_cells) != len(before):
+        raise ValueError(f"expected one set of free storage cells per robot, got {len(free_cells)}")
     if progress.targets != requested_cells:
         progress.approach = [None] * len(progress.approach)
         progress.targets = requested_cells
     delivered = float(warehouse_team_reward) > 0.0
     return tuple(
-        _robot_bonus(previous, current, requested_cells, goals, delivered, action, progress, index)
+        _robot_bonus(previous, current, requested_cells, goals, delivered, action, progress, index, free_cells[index])
         for index, (previous, current, action) in enumerate(zip(before, after, actions))
     )
 
 
-def _robot_bonus(previous, current, requested_cells, goals, delivered, action, progress, index):
+def _robot_bonus(previous, current, requested_cells, goals, delivered, action, progress, index, free):
     px, py, was_carrying_requested, was_carrying = previous
     cx, cy, _now_carrying_requested, now_carrying = current
     bonus = 0.0
     if _blocked_forward(action, previous, current):
         bonus += OBSTACLE
     if was_carrying_requested:
+        progress.back[index] = None
         if goals:
             bonus += CARRY_PER_CELL * _record_progress(
                 progress.carry, index, _nearest(px, py, goals), _nearest(cx, cy, goals)
@@ -107,14 +127,31 @@ def _robot_bonus(previous, current, requested_cells, goals, delivered, action, p
             bonus -= PICKUP
             progress.carry[index] = None
             progress.approach[index] = None
-    elif requested_cells and not delivered:
-        bonus += APPROACH_PER_CELL * _record_progress(
-            progress.approach, index, _nearest(px, py, requested_cells), _nearest(cx, cy, requested_cells)
-        )
-        if (not was_carrying) and now_carrying and _now_holds_requested(current):
-            bonus += PICKUP
-            progress.approach[index] = None
-            progress.carry[index] = _nearest(cx, cy, goals) if goals else None
+    elif was_carrying:
+        # A shelf nobody is asking for: the delivered one, or one lifted by
+        # mistake. It cannot score, and the robot cannot pick up a request
+        # while it holds it. The only useful move is to put it back.
+        progress.carry[index] = None
+        if free:
+            bonus += RETURN_PER_CELL * _record_progress(
+                progress.back, index, _nearest(px, py, free), _nearest(cx, cy, free)
+            )
+        if not now_carrying:
+            bonus += PUT_BACK
+            progress.back[index] = None
+    else:
+        if requested_cells and not delivered:
+            bonus += APPROACH_PER_CELL * _record_progress(
+                progress.approach, index, _nearest(px, py, requested_cells), _nearest(cx, cy, requested_cells)
+            )
+            if now_carrying and _now_holds_requested(current):
+                bonus += PICKUP
+                progress.approach[index] = None
+                progress.carry[index] = _nearest(cx, cy, goals) if goals else None
+        if now_carrying and not _now_holds_requested(current):
+            # Lifting a shelf nobody asked for costs what putting it back pays.
+            bonus -= PUT_BACK
+            progress.back[index] = None
     if delivered:
         progress.approach[index] = None
     return bonus

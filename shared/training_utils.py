@@ -11,7 +11,7 @@ import numpy as np
 from environment.config import MAX_STEPS, N_ACTIONS, N_AGENTS, OBS_SIZE
 from shared.learning_reward import ProgressRecord, robot_bonuses
 from shared.reward_manager import robot_rewards, team_reward
-from shared.task_features import TASK_OBS_SIZE, attach_task
+from shared.task_features import TASK_OBS_SIZE, attach_task, free_storage_cells
 
 
 def is_true_terminal(step_index, terminated, truncated):
@@ -144,12 +144,17 @@ def _one_step(env, observations, choose_actions):
     goals = tuple((int(x), int(y)) for x, y in warehouse.goals)
     requested_cells = tuple((int(shelf.x), int(shelf.y)) for shelf in queue)
     before = tuple(_robot_snapshot(agent, queue_ids) for agent in warehouse.agents)
+    # Only a loaded robot has a shelf to put down.
+    free_cells = tuple(
+        free_storage_cells(warehouse, agent) if agent.carrying_shelf is not None else ()
+        for agent in warehouse.agents
+    )
     next_observations, rewards, terminated, truncated, _info = env.step(actions)
     after = tuple(_robot_snapshot(agent, queue_ids) for agent in warehouse.agents)
     next_observations = attach_task(warehouse, next_observations)
     paid = robot_rewards(rewards)
     raw = team_reward(paid)
-    bonuses = robot_bonuses(before, after, requested_cells, goals, raw, actions, _progress(env))
+    bonuses = robot_bonuses(before, after, requested_cells, goals, raw, actions, _progress(env), free_cells)
     return Transition(
         observations=observations,
         actions=actions,
