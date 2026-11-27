@@ -824,7 +824,7 @@ independently for each robot with `numpy.random.default_rng(seed)` from
 `0 .. n_actions-1`. The same seed therefore repeats the same layout and the
 same action sequence.
 
-## Design consequences for SARSA, REINFORCE, and PPO
+## Design consequences for Q-learning, SARSA, REINFORCE, and PPO
 
 {notes_md}
 
@@ -882,6 +882,20 @@ def algorithm_notes(inspection, observation, summary):
         f"Those failures pay 0, the same as a successful step that does not deliver."
     )
     return {
+        "Q-learning": (
+            f"{shared} Tabular Q-learning uses the same compact state and the same "
+            f"{len(Action)} actions as SARSA. It cannot use the raw "
+            f"{observation['shape_per_robot'][0]}-value vector as a table key. "
+            f"The grid is {inspection['grid_rows']}x{inspection['grid_columns']}, "
+            f"and the shelves and the request queue change the sensor bits. "
+            f"{sparse} {horizon_text} The backup reads the best next action, not "
+            f"the epsilon-greedy action that will be executed next. A step marked "
+            f"terminated, including the {horizon}-step limit, drops that next-state "
+            f"term. {partial} {collisions} Independent Q-learning on each "
+            f"robot's own reward never credits the robot that did not deliver. "
+            f"Summing the list matches the cooperative task and gives both robots "
+            f"the same team target."
+        ),
         "SARSA": (
             f"{shared} Tabular SARSA can index the {len(Action)} actions, or the "
             f"{joint} joint actions, but it cannot use the raw "

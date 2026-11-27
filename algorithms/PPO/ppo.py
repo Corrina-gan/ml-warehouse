@@ -19,6 +19,11 @@ The policy loss is the clipped surrogate. The value loss is squared error on
 the return. An entropy bonus keeps probability on unused actions. Deliveries
 are rare under a random policy, and a collapsed categorical distribution
 would stop searching for them.
+
+The return used for the update is transition.learning_reward. That is the
+warehouse team reward plus the stage bonus in shared.learning_reward, the
+same bonus Q-learning, SARSA, and REINFORCE train on. The saved evaluation score does
+not include it.
 """
 
 from pathlib import Path
@@ -30,8 +35,9 @@ from torch.distributions import Categorical
 from algorithms.PPO.actor import Actor
 from algorithms.PPO.config import PPOSettings
 from algorithms.PPO.critic import Critic
-from environment.config import LEARNING_SIGNAL, N_AGENTS, PARAM_SHARING
-from shared.observation import INPUT_DIM, batch_network_input
+from environment.config import LEARNING_SIGNAL, N_AGENTS, OBS_SIZE, PARAM_SHARING
+from shared.action_mask import blocked_forward, mask_forward_logits
+from shared.observation import INPUT_DIM, REQUESTED_HERE_INDEX, batch_network_input
 from shared.training_utils import is_true_terminal
 
 
@@ -82,22 +88,27 @@ def _normalize(advantages):
 
 
 def _rollout_targets(rollout):
-    """Team reward for both robots, plus the done and bootstrap flags."""
+    """Learning reward for both robots, plus the done and bootstrap flags.
+
+    learning_reward is that robot's warehouse reward plus its own stage bonus.
+    team_reward stays the warehouse sum and is the number written to the training log.
+    """
     transitions = rollout.transitions
     if not transitions:
         raise ValueError("PPO needs at least one transition")
 
     steps = len(transitions)
     rewards = np.zeros((steps, N_AGENTS), dtype=np.float32)
+    warehouse = np.zeros(steps, dtype=np.float32)
+    recorded = np.zeros(steps, dtype=np.float32)
     done = np.zeros(steps, dtype=np.float32)
     true_terminal = np.zeros(steps, dtype=np.float32)
     actions = np.zeros((steps, N_AGENTS), dtype=np.int64)
     episode_step = 0
     for t, step in enumerate(transitions):
-        # The same team sum is the reward for both rows. The delivering robot
-        # already received 1 from the warehouse; the other received 0. Summing
-        # credits the shared policy for the delivery.
-        rewards[t] = step.team_reward
+        warehouse[t] = step.team_reward
+        rewards[t] = step.learning_rewards
+        recorded[t] = float(step.learning_reward) - float(step.team_reward)
         done[t] = float(step.done)
         true_terminal[t] = float(is_true_terminal(episode_step, step.terminated, step.truncated))
         actions[t] = step.actions
@@ -105,7 +116,7 @@ def _rollout_targets(rollout):
 
     observations = batch_network_input(step.observations for step in transitions)
     next_observations = batch_network_input(step.next_observations for step in transitions)
-    return observations, next_observations, actions, rewards, done, true_terminal
+    return observations, next_observations, actions, rewards, done, true_terminal, warehouse, recorded
 
 
 class PPOAgent:
@@ -121,6 +132,7 @@ class PPOAgent:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.actor = Actor(self.settings.hidden).to(self.device)
         self.critic = Critic(self.settings.hidden).to(self.device)
+        self._offset_scale = self._offset_weights(self.device)
         self.optimizer = torch.optim.Adam(
             self._parameters(),
             lr=self.settings.learning_rate,
@@ -135,23 +147,46 @@ class PPOAgent:
         """Argmax of the action logits. evaluate() requires this greedy policy."""
         return self._actions(observations, deterministic=True)
 
+    def action_probabilities(self, observations):
+        """Probability of each action for each robot, in action-id order."""
+        features = self._features(observations)
+        with torch.no_grad():
+            logits = self._masked_logits(self.actor(features), observations)
+            return Categorical(logits=logits).probs.detach().cpu().numpy()
+
     def _actions(self, observations, deterministic):
         features = self._features(observations)
         with torch.no_grad():
-            logits = self.actor(features)
+            logits = self._masked_logits(self.actor(features), observations)
             if deterministic:
-                actions = torch.argmax(logits, dim=-1)
+                actions = _greedy_actions(logits)
             else:
                 actions = Categorical(logits=logits).sample()
         return tuple(int(action) for action in actions.tolist())
 
-    def update(self, rollout):
-        """One PPO update on a collect_steps rollout. Returns the mean losses."""
-        observations, next_observations, actions, rewards, done, true_terminal = _rollout_targets(rollout)
+    def entropy_coefficient(self, env_steps):
+        """Linear fall from entropy_coef_start at step 0 to entropy_coef_end at the budget."""
+        total = float(self.settings.total_env_steps)
+        if total <= 0.0:
+            raise ValueError("total_env_steps must be positive")
+        progress = min(max(float(env_steps), 0.0), total) / total
+        start = float(self.settings.entropy_coef_start)
+        end = float(self.settings.entropy_coef_end)
+        return start + (end - start) * progress
+
+    def update(self, rollout, env_steps=0):
+        """One PPO update on a collect_steps rollout. Returns the mean losses.
+
+        env_steps is how far through the run this rollout starts. It selects
+        the entropy coefficient for this update.
+        """
+        observations, next_observations, actions, rewards, done, true_terminal, warehouse, recorded = _rollout_targets(
+            rollout
+        )
         with torch.no_grad():
             flat_obs = self._flat(observations)
             flat_next = self._flat(next_observations)
-            logits = self.actor(flat_obs)
+            logits = self._masked_logits(self.actor(flat_obs), observations)
             values = self.critic(flat_obs)
             next_values = self.critic(flat_next)
             old_log_probs = Categorical(logits=logits).log_prob(self._actions_tensor(actions))
@@ -169,6 +204,7 @@ class PPOAgent:
             gae_lambda=self.settings.gae_lambda,
         )
         policy_advantages = _normalize(advantages)
+        entropy_coef = self.entropy_coefficient(env_steps)
 
         features = flat_obs.detach()
         actions_t = self._actions_tensor(actions)
@@ -201,6 +237,8 @@ class PPOAgent:
                     old_log_probs[index],
                     advantages_t[index],
                     returns_t[index],
+                    entropy_coef,
+                    self._blocked_tensor(observations)[index],
                 )
                 if not np.isfinite(metrics["loss"]):
                     raise RuntimeError(f"PPO loss is not finite: {metrics}")
@@ -213,14 +251,19 @@ class PPOAgent:
                 updates += 1
 
         result = {key: value / updates for key, value in totals.items()}
-        result["team_reward_sum"] = float(rewards[:, 0].sum())
+        result["entropy_coef"] = float(entropy_coef)
+        # team_reward_sum stays the warehouse return. The chart compares that
+        # number with Q-learning, SARSA, and REINFORCE. The other two sums are training-only.
+        result["team_reward_sum"] = float(warehouse.sum())
+        result["shaping_sum"] = float(recorded.sum())
         result["explained_variance"] = _explained_variance(values_np.reshape(-1), returns.reshape(-1))
         return result
 
-    def _loss(self, features, actions, old_log_probs, advantages, returns):
+    def _loss(self, features, actions, old_log_probs, advantages, returns, entropy_coef, blocked):
         # Separate networks: the clipped surrogate reaches the actor, and the
-        # squared error on the return reaches the critic.
-        logits = self.actor(features)
+        # squared error on the return reaches the critic. Forward is removed
+        # from the distribution where the warehouse would cancel that move.
+        logits = mask_forward_logits(self.actor(features), blocked)
         values = self.critic(features)
         distribution = Categorical(logits=logits)
         new_log_probs = distribution.log_prob(actions)
@@ -234,7 +277,7 @@ class PPOAgent:
         policy_loss = -torch.min(unclipped, clipped).mean()
         value_loss = (values - returns).pow(2).mean()
         entropy = distribution.entropy().mean()
-        loss = policy_loss + self.settings.value_coef * value_loss - self.settings.entropy_coef * entropy
+        loss = policy_loss + self.settings.value_coef * value_loss - float(entropy_coef) * entropy
         with torch.no_grad():
             approx_kl = ((ratio - 1.0) - log_ratio).mean()
             clip_fraction = ((ratio - 1.0).abs() > self.settings.clip_eps).float().mean()
@@ -275,14 +318,44 @@ class PPOAgent:
 
     def _features(self, observations):
         array = batch_network_input((observations,))[0]
-        return torch.as_tensor(np.ascontiguousarray(array), dtype=torch.float32, device=self.device)
+        tensor = torch.as_tensor(np.ascontiguousarray(array), dtype=torch.float32, device=self.device)
+        return self._scale_destination(tensor)
 
     def _flat(self, observations):
         steps, agents, width = observations.shape
         if agents != N_AGENTS or width != INPUT_DIM:
             raise ValueError(f"expected observations {(steps, N_AGENTS, INPUT_DIM)}, got {observations.shape}")
         flat = np.ascontiguousarray(observations).reshape(steps * agents, width)
-        return torch.as_tensor(flat, dtype=torch.float32, device=self.device)
+        tensor = torch.as_tensor(flat, dtype=torch.float32, device=self.device)
+        return self._scale_destination(tensor)
+
+    def _offset_weights(self, device):
+        """1 on untouched inputs. Destination, column/row, and the requested bit are scaled."""
+        weights = torch.ones(INPUT_DIM, dtype=torch.float32, device=device)
+        weights[0:2] = float(self.settings.coordinate_scale)
+        weights[OBS_SIZE:OBS_SIZE + 4] = float(self.settings.destination_scale)
+        weights[REQUESTED_HERE_INDEX] = float(self.settings.requested_scale)
+        return weights
+
+    def _scale_destination(self, features):
+        if features.shape[-1] != INPUT_DIM:
+            raise ValueError(f"expected the last dimension to be {INPUT_DIM}, got {features.shape[-1]}")
+        return features * self._offset_scale
+
+    def _masked_logits(self, logits, observations):
+        return mask_forward_logits(logits, self._blocked_tensor(observations))
+
+    def _blocked_tensor(self, observations):
+        """True where forward is cancelled. Shape matches the flat action batch."""
+        if isinstance(observations, np.ndarray):
+            unscaled = observations
+        else:
+            unscaled = batch_network_input((observations,))[0]
+        if self.settings.mask_blocked_forward:
+            blocked = blocked_forward(unscaled)
+        else:
+            blocked = np.zeros(unscaled.shape[:-1], dtype=bool)
+        return torch.as_tensor(np.asarray(blocked).reshape(-1), dtype=torch.bool, device=self.device)
 
     def _actions_tensor(self, actions):
         flat = np.asarray(actions, dtype=np.int64).reshape(-1)
@@ -292,11 +365,47 @@ class PPOAgent:
 def load_agent(path):
     """Rebuild the actor and the critic from ppo.pt and load their weights."""
     checkpoint = _read_checkpoint(path, map_location="cpu")
-    raw = dict(checkpoint["settings"])
-    raw["hidden"] = tuple(raw["hidden"])
-    agent = PPOAgent(PPOSettings(**raw))
+    agent = PPOAgent(_settings_from_checkpoint(checkpoint["settings"]))
     agent._load_weights(checkpoint)
     return agent
+
+
+def _settings_from_checkpoint(raw):
+    """Accept a checkpoint saved before the entropy schedule and destination scale.
+
+    An old file has one entropy_coef and no destination_scale. Those runs
+    trained on the unscaled offsets, so the scale stays 1 and the coefficient
+    stays flat.
+    """
+    values = dict(raw)
+    values["hidden"] = tuple(values["hidden"])
+    if "entropy_coef_start" not in values and "entropy_coef" in values:
+        coefficient = float(values.pop("entropy_coef"))
+        values["entropy_coef_start"] = coefficient
+        values["entropy_coef_end"] = coefficient
+    else:
+        values.pop("entropy_coef", None)
+    values.setdefault("destination_scale", 1.0)
+    values.setdefault("coordinate_scale", 1.0)
+    values.setdefault("requested_scale", 1.0)
+    values.setdefault("mask_blocked_forward", False)
+    known = set(PPOSettings.__dataclass_fields__)
+    return PPOSettings(**{key: value for key, value in values.items() if key in known})
+
+
+def _greedy_actions(logits):
+    """Argmax. A tie that includes no-op does not become no-op.
+
+    Action 0 is wait. torch.argmax returns the lowest index, so equal logits
+    always wait. When wait shares the best value with another action, drop
+    wait and take the best of the rest. A strictly higher wait logit is kept.
+    """
+    best = logits.max(dim=-1, keepdim=True).values
+    tied = logits >= best - 1e-5
+    drop_wait = tied[:, 0] & tied[:, 1:].any(dim=-1)
+    adjusted = logits.clone()
+    adjusted[drop_wait, 0] = torch.finfo(logits.dtype).min
+    return torch.argmax(adjusted, dim=-1)
 
 
 def _read_checkpoint(path, map_location):

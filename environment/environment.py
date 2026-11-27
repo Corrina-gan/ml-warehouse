@@ -1,4 +1,4 @@
-"""Shared warehouse for SARSA, REINFORCE, and PPO.
+"""Shared warehouse for Q-learning, SARSA, REINFORCE, and PPO.
 
 This module only creates the existing ``rware-tiny-2ag-v2`` environment.
 It does not change the grid, the transitions, or the reward.
@@ -9,6 +9,8 @@ import rware
 
 from environment.config import (
     ENV_ID,
+    GRID_COLS,
+    GRID_ROWS,
     MAX_STEPS,
     N_ACTIONS,
     N_AGENTS,
@@ -52,6 +54,8 @@ def check_contract():
             raise AssertionError(f"environment id is not {ENV_ID}")
         if warehouse.n_agents != N_AGENTS:
             raise AssertionError(f"n_agents is {warehouse.n_agents}, expected {N_AGENTS}")
+        if tuple(warehouse.grid_size) != (GRID_ROWS, GRID_COLS):
+            raise AssertionError(f"grid_size is {warehouse.grid_size}, expected {(GRID_ROWS, GRID_COLS)}")
         if warehouse.max_steps != MAX_STEPS:
             raise AssertionError(f"max_steps is {warehouse.max_steps}, expected {MAX_STEPS}")
         if len(env.action_space) != N_AGENTS:

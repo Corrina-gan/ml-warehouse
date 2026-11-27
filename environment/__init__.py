@@ -1,4 +1,4 @@
-"""Shared ``rware-tiny-2ag-v2`` warehouse used by SARSA, REINFORCE, and PPO."""
+"""Shared ``rware-tiny-2ag-v2`` warehouse used by Q-learning, SARSA, REINFORCE, and PPO."""
 
 from environment.config import (
     ACTION_NAMES,

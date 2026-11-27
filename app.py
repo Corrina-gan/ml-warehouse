@@ -10,14 +10,29 @@ page = st.navigation(
     [
         st.Page(
             "app_pages/analysis.py",
-            title="Analysis",
+            title="Exploratory data analysis",
             icon=":material/query_stats:",
             default=True,
         ),
         st.Page(
             "app_pages/warehouse.py",
-            title="Warehouse",
+            title="Warehouse simulation",
             icon=":material/warehouse:",
+        ),
+        st.Page(
+            "app_pages/results.py",
+            title="Results and comparison",
+            icon=":material/leaderboard:",
+        ),
+        st.Page(
+            "app_pages/selection.py",
+            title="Model selection",
+            icon=":material/checklist:",
+        ),
+        st.Page(
+            "app_pages/tuning.py",
+            title="Hyperparameter search",
+            icon=":material/tune:",
         ),
         st.Page(
             "app_pages/shared.py",

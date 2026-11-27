@@ -17,7 +17,7 @@ from environment.config import (
 from shared import INPUT_DIM
 
 st.caption(
-    "SARSA, REINFORCE, and PPO import these modules. They do not each create a "
+    "Q-learning, SARSA, REINFORCE, and PPO import these modules. They do not each create a "
     "different warehouse or a different score."
 )
 
@@ -42,13 +42,18 @@ from shared import (
 )
 ```
 
-`make_warehouse()` returns `rware-tiny-2ag-v2` with its registered settings. `network_input` appends an agent-ID one-hot to the 71 observation values. `team_reward` is the sum of the two robot rewards, not the average.
+`make_warehouse()` returns `rware-tiny-2ag-v2` with its registered settings. The warehouse observation is 71 values. `attach_task` adds the offset to the requested shelf, and the offset to a goal after that shelf is picked up. `network_input` then appends an agent-ID one-hot. `team_reward` is the sum of the two robot rewards, not the average. The training update also adds a stage bonus: +0.05 per cell closer to the requested shelf, +0.20 for picking it up, +0.05 per cell closer to a goal while carrying it, and -0.05 for a blocked forward. A missed load toggle is not charged, and circling back to a shelf does not pay the closer bonus again. A delivery is the warehouse reward of 1. Evaluation scores the warehouse sum only.
 """
 )
 
 st.subheader("How each algorithm steps")
 st.dataframe(
     [
+        {
+            "Algorithm": "Q-learning",
+            "Loop": "iterate_episode",
+            "Why": "Update after each step from the best action in the next state.",
+        },
         {
             "Algorithm": "SARSA",
             "Loop": "iterate_episode",

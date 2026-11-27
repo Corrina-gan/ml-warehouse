@@ -11,6 +11,12 @@ N_AGENTS = 2
 OBS_SIZE = 71
 N_ACTIONS = 5
 
+# rware-tiny-2ag-v2 grid. Rows are grid_size[0], columns are grid_size[1]:
+# (column_height + 1) * shelf_rows + 2, (2 + 1) * shelf_columns + 1
+# with shelf_rows 1, shelf_columns 3, column_height 8.
+GRID_ROWS = 11
+GRID_COLS = 10
+
 # Registered episode length. A delivery does not end the episode.
 MAX_STEPS = 500
 
