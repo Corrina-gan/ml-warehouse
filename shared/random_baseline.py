@@ -1,6 +1,6 @@
 """Score a uniform random policy on the held-out evaluation seeds.
 
-This is the comparison floor for SARSA, REINFORCE, and PPO. It does not
+This is the comparison floor for Q-learning, SARSA, REINFORCE, and PPO. It does not
 train, and it does not use the EDA seeds 0..99.
 
 Run from the project root:

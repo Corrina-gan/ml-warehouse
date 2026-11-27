@@ -9,7 +9,9 @@ from dataclasses import dataclass
 import numpy as np
 
 from environment.config import MAX_STEPS, N_ACTIONS, N_AGENTS, OBS_SIZE
+from shared.learning_reward import ProgressRecord, robot_bonuses
 from shared.reward_manager import robot_rewards, team_reward
+from shared.task_features import TASK_OBS_SIZE, attach_task
 
 
 def is_true_terminal(step_index, terminated, truncated):
@@ -39,9 +41,11 @@ def as_actions(actions):
 def copy_observations(observations):
     """A detached copy of each robot's observation."""
     copied = tuple(np.array(obs, dtype=np.float32, copy=True) for obs in observations)
-    if len(copied) != N_AGENTS or any(obs.shape != (OBS_SIZE,) for obs in copied):
+    if len(copied) != N_AGENTS or any(obs.shape[0] not in (OBS_SIZE, TASK_OBS_SIZE) for obs in copied):
         shapes = tuple(obs.shape for obs in copied)
-        raise ValueError(f"expected {N_AGENTS} observations of shape {(OBS_SIZE,)}, got {shapes}")
+        raise ValueError(
+            f"expected {N_AGENTS} observations of length {OBS_SIZE} or {TASK_OBS_SIZE}, got {shapes}"
+        )
     return copied
 
 
@@ -55,6 +59,13 @@ class Transition:
     next_observations: tuple
     terminated: bool
     truncated: bool
+    # Warehouse reward plus that robot's stage bonus. evaluate() does not
+    # read this field. team_reward stays the warehouse sum.
+    learning_rewards: tuple
+
+    @property
+    def learning_reward(self):
+        return float(sum(self.learning_rewards))
 
     @property
     def team_reward(self):
@@ -113,28 +124,75 @@ class Rollout:
 def _reset(env, seed, on_episode_start):
     observations, _info = env.reset(seed=seed)
     observations = copy_observations(observations)
+    record = getattr(env, "_progress_record", None)
+    if record is not None:
+        record.reset()
     if on_episode_start is not None:
         on_episode_start(observations)
     return observations
 
 
 def _one_step(env, observations, choose_actions):
+    warehouse = env.unwrapped
+    # Attach once. A second copy would break SARSA, which executes the action
+    # it already chose for this exact observation object.
+    if _raw_observation(observations):
+        observations = attach_task(warehouse, observations)
     actions = as_actions(choose_actions(observations))
+    queue = list(warehouse.request_queue)
+    queue_ids = {id(shelf) for shelf in queue}
+    goals = tuple((int(x), int(y)) for x, y in warehouse.goals)
+    requested_cells = tuple((int(shelf.x), int(shelf.y)) for shelf in queue)
+    before = tuple(_robot_snapshot(agent, queue_ids) for agent in warehouse.agents)
     next_observations, rewards, terminated, truncated, _info = env.step(actions)
+    after = tuple(_robot_snapshot(agent, queue_ids) for agent in warehouse.agents)
+    next_observations = attach_task(warehouse, next_observations)
+    paid = robot_rewards(rewards)
+    raw = team_reward(paid)
+    bonuses = robot_bonuses(before, after, requested_cells, goals, raw, actions, _progress(env))
     return Transition(
         observations=observations,
         actions=actions,
-        rewards=robot_rewards(rewards),
+        rewards=paid,
         next_observations=copy_observations(next_observations),
         terminated=bool(terminated),
         truncated=bool(truncated),
+        learning_rewards=tuple(paid[index] + bonuses[index] for index in range(len(paid))),
+    )
+
+
+def _progress(env):
+    """Best-distance record for this environment. A finished episode clears it."""
+    record = getattr(env, "_progress_record", None)
+    if record is None:
+        record = ProgressRecord()
+        env._progress_record = record
+    return record
+
+
+def _raw_observation(observations):
+    first = np.asarray(observations[0]).reshape(-1)
+    return first.shape[0] == OBS_SIZE
+
+
+def _robot_snapshot(agent, queue_ids):
+    carried = agent.carrying_shelf
+    carrying = carried is not None
+    return (
+        int(agent.x),
+        int(agent.y),
+        carrying and id(carried) in queue_ids,
+        carrying,
     )
 
 
 def iterate_episode(env, choose_actions, seed=None, on_episode_start=None):
     """Yield one transition at a time.
 
-    SARSA updates from the yielded step before the next action is chosen.
+    SARSA updates from the yielded step. The caller chooses the next action
+    for that backup and returns the same action the next time this generator
+    asks for one. Q-learning updates from the same step and chooses again
+    on the next call, because its target uses the max over the next state.
     The generator stops when the environment sets done, and also stops at
     MAX_STEPS. done cuts the episode. It is not a terminal bootstrap.
     """
@@ -143,6 +201,7 @@ def iterate_episode(env, choose_actions, seed=None, on_episode_start=None):
         transition = _one_step(env, observations, choose_actions)
         yield transition
         if transition.done:
+            _progress(env).reset()
             break
         observations = transition.next_observations
 
@@ -152,8 +211,9 @@ def run_episode(env, choose_actions, seed=None, on_episode_start=None):
 
     choose_actions(observations) returns one int per robot.
     on_episode_start(observations) runs after reset, before the first action.
-    This stores a finished episode. SARSA should use iterate_episode, and a
-    fixed-length PPO rollout should use collect_steps.
+    This stores a finished episode. SARSA should use iterate_episode so the
+    backup can run before the next step, and a fixed-length PPO rollout
+    should use collect_steps.
     """
     return Episode(
         transitions=tuple(iterate_episode(env, choose_actions, seed, on_episode_start)),
@@ -183,6 +243,7 @@ def collect_steps(env, choose_actions, n_steps, seed=None, observations=None, on
         transition = _one_step(env, observations, choose_actions)
         transitions.append(transition)
         if transition.done:
+            _progress(env).reset()
             observations = _reset(env, next_seed, on_episode_start)
             if next_seed is not None:
                 next_seed += 1
