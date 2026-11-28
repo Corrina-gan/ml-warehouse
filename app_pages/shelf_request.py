@@ -1,15 +1,20 @@
 """Ask for one shelf by ID and play a saved policy."""
 
+import time
+
 import streamlit as st
 
 from app_pages.results_data import best_saved_policy, build_report
 from app_pages.warehouse_view import (
+    PLAYBACK,
+    SEND_PAUSE,
     SPEEDS,
     _checkpoint,
     _count_text,
     _frame_caption,
     _image_html,
     _load_agent,
+    _refresh,
     _score_so_far,
     render,
 )
@@ -299,29 +304,33 @@ def _step_once(length):
     st.session_state["shelf_step"] = min(int(st.session_state.get("shelf_step", 0)) + 1, length)
 
 
-def _tick(episode):
+def _tick(episode, speed):
+    seconds, steps = PLAYBACK[speed]
     length = len(episode["frames"]) - 1
-    nxt = min(int(st.session_state.get("shelf_step", 0)) + 1, length)
+    step = int(st.session_state.get("shelf_step", 0))
+    nxt = min(step + steps, length)
     st.session_state["shelf_step"] = nxt
-    if nxt >= length:
+    _draw(episode, nxt - step, seconds)
+    time.sleep(SEND_PAUSE)
+    if nxt == step:
+        # Nothing was left to play: the refresh before this one showed the last steps.
         st.session_state["shelf_playing"] = False
         st.rerun()
-    _draw(episode)
 
 
-@st.fragment(run_every=0.4)
+@st.fragment(run_every=_refresh("Slow"))
 def _playing_slow(episode):
-    _tick(episode)
+    _tick(episode, "Slow")
 
 
-@st.fragment(run_every=0.15)
+@st.fragment(run_every=_refresh("Normal"))
 def _playing_normal(episode):
-    _tick(episode)
+    _tick(episode, "Normal")
 
 
-@st.fragment(run_every=0.05)
+@st.fragment(run_every=_refresh("Fast"))
 def _playing_fast(episode):
-    _tick(episode)
+    _tick(episode, "Fast")
 
 
 def _players():
@@ -333,7 +342,7 @@ def _paused(episode):
     _draw(episode)
 
 
-def _draw(episode):
+def _draw(episode, steps=0, seconds=0.0):
     length = len(episode["frames"]) - 1
     st.slider("Step", min_value=0, max_value=max(length, 1), key="shelf_step")
     step = min(int(st.session_state["shelf_step"]), length)
@@ -347,5 +356,10 @@ def _draw(episode):
         f"Reward so far {_count_text(total_reward)}, deliveries {deliveries}. "
         "Orange is robot 1. Blue is robot 2."
     )
-    st.html(_image_html(render(episode["layout"], frame), episode["shelf"]["code"]))
+    st.html(
+        _image_html(
+            render(episode["layout"], frame, episode["frames"][:step], steps, seconds),
+            episode["shelf"]["code"],
+        )
+    )
     st.caption(_frame_caption(frame))
